@@ -9,8 +9,14 @@ use crate::error::{VaultError, VaultResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPath {
+    /// Normalized spelling supplied by the caller.
+    pub requested: PathBuf,
+    /// Actual on-disk spelling reached while walking the vault.
     pub relative: PathBuf,
     pub absolute: PathBuf,
+    /// Vault-relative path after resolving symlinks (or the nearest existing
+    /// parent for a destination that does not exist yet).
+    pub canonical_relative: PathBuf,
 }
 
 /// Normalize a vault-relative path, rejecting absolute paths and root escapes.
@@ -56,8 +62,10 @@ pub fn resolve_existing(vault_root: &Path, relative: &Path) -> VaultResult<Resol
 
     if normalized.as_os_str().is_empty() {
         return Ok(ResolvedPath {
+            requested: normalized,
             relative: PathBuf::new(),
-            absolute: canonical_root,
+            absolute: canonical_root.clone(),
+            canonical_relative: PathBuf::new(),
         });
     }
 
@@ -74,9 +82,13 @@ pub fn resolve_existing(vault_root: &Path, relative: &Path) -> VaultResult<Resol
         ensure_inside_root(&canonical_root, &absolute, relative)?;
     }
 
+    let canonical_absolute = absolute.canonicalize()?;
+    let canonical_relative = relative_from_absolute(&canonical_root, &canonical_absolute)?;
     Ok(ResolvedPath {
+        requested: normalized,
         relative: forward_slash_path(&actual_relative),
         absolute,
+        canonical_relative,
     })
 }
 
@@ -94,8 +106,10 @@ pub fn resolve_for_write(vault_root: &Path, relative: &Path) -> VaultResult<Reso
 
     if normalized.as_os_str().is_empty() {
         return Ok(ResolvedPath {
+            requested: normalized,
             relative: PathBuf::new(),
-            absolute: canonical_root,
+            absolute: canonical_root.clone(),
+            canonical_relative: PathBuf::new(),
         });
     }
 
@@ -117,18 +131,25 @@ pub fn resolve_for_write(vault_root: &Path, relative: &Path) -> VaultResult<Reso
                     absolute.push(remaining);
                     actual_relative.push(remaining);
                 }
-                ensure_write_parent_inside_root(&canonical_root, &absolute, relative)?;
+                let canonical_relative =
+                    canonical_destination_relative(&canonical_root, &absolute, relative)?;
                 return Ok(ResolvedPath {
+                    requested: normalized,
                     relative: forward_slash_path(&actual_relative),
                     absolute,
+                    canonical_relative,
                 });
             }
         }
     }
 
+    let canonical_absolute = absolute.canonicalize()?;
+    let canonical_relative = relative_from_absolute(&canonical_root, &canonical_absolute)?;
     Ok(ResolvedPath {
+        requested: normalized,
         relative: forward_slash_path(&actual_relative),
         absolute,
+        canonical_relative,
     })
 }
 
@@ -217,18 +238,21 @@ fn ensure_inside_root(
     Ok(())
 }
 
-fn ensure_write_parent_inside_root(
+fn canonical_destination_relative(
     canonical_root: &Path,
     absolute: &Path,
     original_path: &Path,
-) -> VaultResult<()> {
-    if let Some(parent) = nearest_existing_parent(absolute) {
-        let canonical_parent = parent.canonicalize()?;
-        if !canonical_parent.starts_with(canonical_root) {
-            return Err(VaultError::OutsideVault(original_path.to_path_buf()));
-        }
+) -> VaultResult<PathBuf> {
+    let parent = nearest_existing_parent(absolute)
+        .ok_or_else(|| VaultError::OutsideVault(original_path.to_path_buf()))?;
+    let canonical_parent = parent.canonicalize()?;
+    if !canonical_parent.starts_with(canonical_root) {
+        return Err(VaultError::OutsideVault(original_path.to_path_buf()));
     }
-    Ok(())
+    let suffix = absolute
+        .strip_prefix(&parent)
+        .map_err(|_| VaultError::OutsideVault(original_path.to_path_buf()))?;
+    relative_from_absolute(canonical_root, &canonical_parent.join(suffix))
 }
 
 fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
@@ -282,7 +306,9 @@ mod tests {
         std::fs::write(vault.path().join(&disk_path), "# License\n").unwrap();
 
         let resolved = resolve_existing(vault.path(), Path::new(composed)).unwrap();
+        assert_eq!(resolved.requested, PathBuf::from(composed));
         assert_eq!(resolved.relative, disk_path);
+        assert_eq!(resolved.canonical_relative, disk_path);
         assert!(resolved.absolute.is_file());
     }
 
@@ -312,6 +338,41 @@ mod tests {
 
         let resolved = resolve_for_write(vault.path(), path).unwrap();
         assert_eq!(resolved.relative, path);
+        assert_eq!(resolved.requested, path);
+        assert_eq!(resolved.canonical_relative, path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_existing_records_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let vault = setup_vault();
+        std::fs::create_dir_all(vault.path().join("targets")).unwrap();
+        std::fs::write(vault.path().join("targets/note.md"), "# Target\n").unwrap();
+        symlink("targets/note.md", vault.path().join("alias.md")).unwrap();
+
+        let resolved = resolve_existing(vault.path(), Path::new("alias.md")).unwrap();
+        assert_eq!(resolved.requested, PathBuf::from("alias.md"));
+        assert_eq!(resolved.relative, PathBuf::from("alias.md"));
+        assert_eq!(
+            resolved.canonical_relative,
+            PathBuf::from("targets/note.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_for_write_canonicalizes_existing_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let vault = setup_vault();
+        std::fs::create_dir_all(vault.path().join("targets")).unwrap();
+        symlink("targets", vault.path().join("alias-dir")).unwrap();
+
+        let resolved = resolve_for_write(vault.path(), Path::new("alias-dir/new.md")).unwrap();
+        assert_eq!(resolved.relative, PathBuf::from("alias-dir/new.md"));
+        assert_eq!(resolved.canonical_relative, PathBuf::from("targets/new.md"));
     }
 
     #[test]

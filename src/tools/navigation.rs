@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_metadata_keeps_excluded_and_newly_unindexed_notes_path_only() {
+    async fn list_metadata_hides_excluded_and_keeps_newly_unindexed_notes_path_only() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         fs::create_dir_all(dir.path().join("Archive")).unwrap();
@@ -436,10 +436,16 @@ mod tests {
         .unwrap();
         let entries: Vec<serde_json::Value> = serde_json::from_str(extract_text(&result)).unwrap();
 
-        for path in ["Archive/hidden.md", "late.md"] {
-            let entry = entries.iter().find(|entry| entry["path"] == path).unwrap();
-            assert_eq!(entry, &serde_json::json!({"path": path}));
-        }
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["path"] != "Archive/hidden.md")
+        );
+        let late = entries
+            .iter()
+            .find(|entry| entry["path"] == "late.md")
+            .unwrap();
+        assert_eq!(late, &serde_json::json!({"path": "late.md"}));
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ fn fixture_config() -> Config {
         tool_filter: ToolFilter::Full,
         mcp_data_dir: None,
         exclude_patterns: vec![],
+        write_patterns: vec![],
     }
 }
 
@@ -59,6 +60,7 @@ async fn copy_fixture_to_temp() -> (tempfile::TempDir, Vault) {
         tool_filter: ToolFilter::Full,
         mcp_data_dir: None,
         exclude_patterns: vec![],
+        write_patterns: vec![],
     };
     let vault = Vault::open(&config)
         .await
@@ -457,6 +459,7 @@ mod vault_tantivy_search {
             tool_filter: ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: vec![],
+            write_patterns: vec![],
         };
         let vault = Vault::open(&config)
             .await
@@ -751,6 +754,7 @@ mod unicode_paths {
             tool_filter: ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: vec![],
+            write_patterns: vec![],
         }
     }
 
@@ -896,6 +900,7 @@ mod tool_filtering {
             tool_filter: filter,
             mcp_data_dir: None,
             exclude_patterns: vec![],
+            write_patterns: vec![],
         }
     }
 
@@ -1054,6 +1059,7 @@ mod vault_exclusion {
             tool_filter: ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: patterns,
+            write_patterns: vec![],
         }
     }
 
@@ -1090,10 +1096,9 @@ mod vault_exclusion {
         let stats = vault.vault_stats().unwrap();
         assert_eq!(stats.total_notes, 1, "only non-excluded notes counted");
 
-        let content = vault.read_note(Path::new("Archive/old.md")).unwrap();
         assert!(
-            content.contains("Old Note"),
-            "direct read of excluded note should still work"
+            vault.read_note(Path::new("Archive/old.md")).is_err(),
+            "direct read of excluded note should be denied"
         );
     }
 
@@ -1259,7 +1264,7 @@ mod vault_exclusion {
     }
 
     #[tokio::test]
-    async fn move_into_excluded_dir_removes_from_index() {
+    async fn move_into_excluded_dir_is_denied() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
         std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
@@ -1273,31 +1278,16 @@ mod vault_exclusion {
             "note should be in index before move"
         );
 
-        let new_path = vault
-            .move_note(Path::new("note.md"), Path::new("Archive/moved.md"))
-            .unwrap();
-        assert_eq!(new_path, PathBuf::from("Archive/moved.md"));
-
         assert!(
             vault
-                .get_note_metadata(Path::new("Archive/moved.md"))
-                .is_err(),
-            "note should NOT be in index after moving to excluded dir"
+                .move_note(Path::new("note.md"), Path::new("Archive/moved.md"))
+                .is_err()
         );
-        assert!(
-            vault.get_note_metadata(Path::new("note.md")).is_err(),
-            "old path should be gone from index"
-        );
-
-        let content = vault.read_note(Path::new("Archive/moved.md")).unwrap();
-        assert!(
-            content.contains("Movable Note"),
-            "file should still be readable on disk via direct access"
-        );
+        assert!(vault.get_note_metadata(Path::new("note.md")).is_ok());
     }
 
     #[tokio::test]
-    async fn move_out_of_excluded_dir_adds_to_index() {
+    async fn move_out_of_excluded_dir_is_denied() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
         std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
@@ -1313,21 +1303,12 @@ mod vault_exclusion {
             "excluded note should NOT be in index"
         );
 
-        let new_path = vault
-            .move_note(Path::new("Archive/hidden.md"), Path::new("visible.md"))
-            .unwrap();
-        assert_eq!(new_path, PathBuf::from("visible.md"));
-
-        assert!(
-            vault.get_note_metadata(Path::new("visible.md")).is_ok(),
-            "note should be in index after moving out of excluded dir"
-        );
         assert!(
             vault
-                .get_note_metadata(Path::new("Archive/hidden.md"))
-                .is_err(),
-            "old excluded path should not be in index"
+                .move_note(Path::new("Archive/hidden.md"), Path::new("visible.md"))
+                .is_err()
         );
+        assert!(!dir.path().join("visible.md").exists());
     }
 
     #[tokio::test]
@@ -1362,7 +1343,7 @@ mod vault_exclusion {
     }
 
     #[tokio::test]
-    async fn vault_list_includes_excluded_notes() {
+    async fn vault_list_hides_excluded_notes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
         std::fs::create_dir_all(dir.path().join("Active")).unwrap();
@@ -1379,8 +1360,10 @@ mod vault_exclusion {
             "non-excluded file should appear in listing, got: {files:?}"
         );
         assert!(
-            files.iter().any(|f| f == Path::new("Archive/old.md")),
-            "excluded file should ALSO appear in listing (vault_list is unfiltered), got: {files:?}"
+            files
+                .iter()
+                .all(|f| f != Path::new("Archive") && f != Path::new("Archive/old.md")),
+            "excluded directory and file should not appear in listing, got: {files:?}"
         );
     }
 }
@@ -1412,6 +1395,7 @@ mod vault_semantic_search {
             tool_filter: ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: vec![],
+            write_patterns: vec![],
         }
     }
 
@@ -1681,6 +1665,7 @@ mod semantic_tool_runtime_modes {
             tool_filter: ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: vec![],
+            write_patterns: vec![],
         }
     }
 
@@ -2162,6 +2147,7 @@ mod background_embedding_runtime {
             tool_filter: ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: Vec::new(),
+            write_patterns: Vec::new(),
         }
     }
 

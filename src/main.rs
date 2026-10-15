@@ -934,6 +934,7 @@ mod tests {
             tool_filter: obsidian_mcp::config::ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: vec![],
+            write_patterns: vec![],
         };
         let runtime = init_semantic_runtime(&config, &runtime_config(SemanticMode::Daemon)).await;
         assert!(runtime.daemon_client.is_none());

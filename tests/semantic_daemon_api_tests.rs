@@ -153,6 +153,7 @@ async fn daemon_binary_filters_before_ranking_and_recovers_existing_clients() {
         tool_filter: ToolFilter::Full,
         mcp_data_dir: None,
         exclude_patterns: vec!["Archive/**".into()],
+        write_patterns: vec![],
     };
     let vault = Vault::open(&config).await.unwrap();
     #[cfg(unix)]

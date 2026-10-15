@@ -15,6 +15,12 @@ pub enum VaultError {
     #[error("Invalid path: {0}")]
     InvalidPath(String),
 
+    #[error("Path is excluded by vault policy: {0}")]
+    PathExcluded(PathBuf),
+
+    #[error("Path is read-only under vault policy: {0}")]
+    PathReadOnly(PathBuf),
+
     #[error("Frontmatter parse error in {path}: {source}")]
     FrontmatterParse {
         path: PathBuf,
@@ -96,6 +102,8 @@ impl From<VaultError> for rmcp::ErrorData {
                 ErrorCode::RESOURCE_NOT_FOUND
             }
             VaultError::InvalidPath(_)
+            | VaultError::PathExcluded(_)
+            | VaultError::PathReadOnly(_)
             | VaultError::OutsideVault(_)
             | VaultError::AlreadyExists(_)
             | VaultError::InvalidFrontmatter { .. }

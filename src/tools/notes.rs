@@ -793,7 +793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_many_preserves_direct_access_to_excluded_notes() {
+    async fn read_many_denies_direct_access_to_excluded_notes() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
@@ -811,13 +811,9 @@ mod tests {
                 ..Default::default()
             },
         )
-        .await
-        .unwrap()
-        .0;
+        .await;
 
-        assert_eq!(output.notes.len(), 1);
-        assert_eq!(output.notes[0].content, "secret");
-        assert_eq!(output.skipped_count, 0);
+        assert!(output.is_err());
     }
 
     // ── note_create ─────────────────────────────────────────────────

@@ -90,6 +90,9 @@ pub struct Config {
     pub mcp_data_dir: Option<PathBuf>,
     /// Raw exclusion patterns from `OBSIDIAN_EXCLUDE_PATHS` env var (comma-separated).
     pub exclude_patterns: Vec<String>,
+    /// Optional writable path patterns from `OBSIDIAN_WRITE_PATHS` (comma-separated).
+    /// Empty preserves the historical behavior where every visible path is writable.
+    pub write_patterns: Vec<String>,
 }
 
 // ── Tool Filtering ─────────────────────────────────────────────────
@@ -391,6 +394,13 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let write_patterns: Vec<String> = std::env::var("OBSIDIAN_WRITE_PATHS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         Ok(Self {
             vault_path,
             watch,
@@ -406,6 +416,7 @@ impl Config {
             tool_filter,
             mcp_data_dir,
             exclude_patterns,
+            write_patterns,
         })
     }
 }

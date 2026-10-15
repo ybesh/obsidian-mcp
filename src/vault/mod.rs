@@ -11,6 +11,7 @@ pub mod parser;
 pub mod patch;
 pub mod path;
 pub mod periodic;
+pub mod policy;
 pub mod search_utils;
 pub mod tantivy_index;
 pub mod watcher;
@@ -36,6 +37,8 @@ use crate::models::{
 
 use self::exclude::ExcludeSet;
 use self::index::VaultIndex;
+use self::path::ResolvedPath;
+use self::policy::AccessPolicy;
 use self::tantivy_index::TantivyIndex;
 use self::watcher::ChangeWatcher;
 
@@ -56,6 +59,7 @@ struct VaultInner {
     mcp_home: PathBuf,
     mcp_data: PathBuf,
     exclude: Arc<ExcludeSet>,
+    access_policy: AccessPolicy,
     index: Arc<RwLock<VaultIndex>>,
     mutations: Mutex<()>,
     tantivy: Option<Arc<TantivyIndex>>,
@@ -164,6 +168,7 @@ impl Vault {
         patterns.dedup();
 
         let exclude = Arc::new(exclude::ExcludeSet::build(patterns)?);
+        let access_policy = AccessPolicy::new(Arc::clone(&exclude), config.write_patterns.clone())?;
 
         if !exclude.is_empty() {
             tracing::info!(
@@ -240,6 +245,7 @@ impl Vault {
                 mcp_home,
                 mcp_data,
                 exclude,
+                access_policy,
                 index,
                 mutations: Mutex::new(()),
                 tantivy,
@@ -283,18 +289,25 @@ impl Vault {
         recursive: bool,
         glob: Option<&str>,
     ) -> VaultResult<Vec<PathBuf>> {
-        fs::list_files(&self.inner.root, dir, recursive, glob)
+        self.resolve_existing_for_read(dir)?;
+        Ok(fs::list_files(&self.inner.root, dir, recursive, glob)?
+            .into_iter()
+            .filter(|path| self.resolve_existing_for_read(path).is_ok())
+            .collect())
     }
 
     pub fn read_note(&self, path: &Path) -> VaultResult<String> {
+        self.resolve_existing_for_read(path)?;
         fs::read_file(&self.inner.root, path)
     }
 
     pub fn file_stat(&self, path: &Path) -> VaultResult<FileStat> {
+        self.resolve_existing_for_read(path)?;
         fs::file_stat(&self.inner.root, path)
     }
 
     pub fn write_note(&self, path: &Path, content: &str) -> VaultResult<()> {
+        self.resolve_destination_for_write(path)?;
         let _mutation = self.lock_mutations()?;
         frontmatter::parse_frontmatter(content)?;
         let actual_path = fs::write_file(&self.inner.root, path, content)?;
@@ -303,6 +316,7 @@ impl Vault {
     }
 
     pub fn append_note(&self, path: &Path, content: &str) -> VaultResult<()> {
+        self.resolve_destination_for_write(path)?;
         let _mutation = self.lock_mutations()?;
         let combined = match fs::read_file(&self.inner.root, path) {
             Ok(existing) => existing + content,
@@ -323,6 +337,7 @@ impl Vault {
         content: &str,
         frontmatter: Option<&serde_json::Value>,
     ) -> VaultResult<()> {
+        self.resolve_destination_for_write(path)?;
         let _mutation = self.lock_mutations()?;
         if let Some(value) = frontmatter
             && !value.is_object()
@@ -341,6 +356,7 @@ impl Vault {
 
     /// Prepend content after frontmatter (or at the start if none exists).
     pub fn prepend_note(&self, path: &Path, content: &str) -> VaultResult<()> {
+        self.resolve_existing_for_write(path)?;
         let _mutation = self.lock_mutations()?;
         let existing = fs::read_file(&self.inner.root, path)?;
         let new_content = match frontmatter::extract_raw_frontmatter(&existing) {
@@ -360,6 +376,7 @@ impl Vault {
     }
 
     pub fn delete_note(&self, path: &Path) -> VaultResult<()> {
+        self.resolve_existing_for_write(path)?;
         let _mutation = self.lock_mutations()?;
         let actual_path = fs::delete_file(&self.inner.root, path)?;
         self.write_index().remove_file(&actual_path);
@@ -374,6 +391,8 @@ impl Vault {
     }
 
     pub fn move_note(&self, from: &Path, to: &Path) -> VaultResult<PathBuf> {
+        self.resolve_existing_for_write(from)?;
+        self.resolve_destination_for_write(to)?;
         let _mutation = self.lock_mutations()?;
         let move_result = fs::move_file(&self.inner.root, from, to)?;
         let old_path = move_result.from;
@@ -395,6 +414,7 @@ impl Vault {
     // ── patch delegation ───────────────────────────────────────────────
 
     pub fn patch_note(&self, path: &Path, request: &PatchRequest) -> VaultResult<()> {
+        self.resolve_existing_for_write(path)?;
         let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let patched = patch::apply_patch(&content, request, path)?;
@@ -407,6 +427,7 @@ impl Vault {
     // ── frontmatter delegation ─────────────────────────────────────────
 
     pub fn get_frontmatter(&self, path: &Path) -> VaultResult<Option<serde_json::Value>> {
+        self.resolve_existing_for_read(path)?;
         let content = fs::read_file(&self.inner.root, path)?;
         frontmatter::parse_frontmatter(&content)
     }
@@ -417,6 +438,7 @@ impl Vault {
         key: &str,
         value: serde_json::Value,
     ) -> VaultResult<()> {
+        self.resolve_existing_for_write(path)?;
         let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let updated = frontmatter::set_frontmatter_field(&content, key, value)?;
@@ -427,6 +449,7 @@ impl Vault {
     }
 
     pub fn remove_frontmatter_field(&self, path: &Path, key: &str) -> VaultResult<()> {
+        self.resolve_existing_for_write(path)?;
         let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let updated = frontmatter::remove_frontmatter_field(&content, key)?;
@@ -477,6 +500,7 @@ impl Vault {
     }
 
     pub fn get_document_map(&self, path: &Path) -> VaultResult<DocumentMap> {
+        self.resolve_existing_for_read(path)?;
         let content = fs::read_file(&self.inner.root, path)?;
         Ok(parser::build_document_map(&content))
     }
@@ -732,13 +756,33 @@ impl Vault {
     }
 
     pub(crate) fn canonical_existing_relative_path(&self, path: &Path) -> VaultResult<PathBuf> {
-        Ok(path::resolve_existing(&self.inner.root, path)?.relative)
+        let resolved = self.resolve_existing_for_read(path)?;
+        Ok(resolved.relative)
     }
 
-    /// Validate that a relative path doesn't escape the vault root.
+    /// Validate that a relative path stays inside the vault and is visible under policy.
     pub fn validate_path(&self, path: &Path) -> VaultResult<()> {
-        fs::resolve_path(&self.inner.root, path)?;
+        let resolved = path::resolve_for_write(&self.inner.root, path)?;
+        self.inner.access_policy.authorize_read(&resolved)?;
         Ok(())
+    }
+
+    fn resolve_existing_for_read(&self, path: &Path) -> VaultResult<ResolvedPath> {
+        let resolved = path::resolve_existing(&self.inner.root, path)?;
+        self.inner.access_policy.authorize_read(&resolved)?;
+        Ok(resolved)
+    }
+
+    fn resolve_existing_for_write(&self, path: &Path) -> VaultResult<ResolvedPath> {
+        let resolved = path::resolve_existing(&self.inner.root, path)?;
+        self.inner.access_policy.authorize_write(&resolved)?;
+        Ok(resolved)
+    }
+
+    fn resolve_destination_for_write(&self, path: &Path) -> VaultResult<ResolvedPath> {
+        let resolved = path::resolve_for_write(&self.inner.root, path)?;
+        self.inner.access_policy.authorize_write(&resolved)?;
+        Ok(resolved)
     }
 
     // ── periodic delegation ────────────────────────────────────────────
@@ -751,6 +795,7 @@ impl Vault {
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
         let path = periodic::periodic_note_path(&config, &date)?;
+        self.resolve_existing_for_read(&path)?;
         fs::read_file(&self.inner.root, &path)
     }
 
@@ -764,12 +809,20 @@ impl Vault {
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
         let path = periodic::periodic_note_path(&config, &date)?;
+        self.resolve_destination_for_write(&path)?;
 
         let content = if let Some(custom) = content_override {
             custom.to_owned()
         } else {
             match &config.template {
                 Some(tmpl) if !tmpl.is_empty() => {
+                    let template_path = PathBuf::from(tmpl);
+                    let template_path = if template_path.extension().is_none() {
+                        template_path.with_extension("md")
+                    } else {
+                        template_path
+                    };
+                    self.resolve_existing_for_read(&template_path)?;
                     let title = path
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -797,7 +850,23 @@ impl Vault {
         limit: usize,
     ) -> VaultResult<Vec<PathBuf>> {
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
-        periodic::list_recent_periodic_notes(&self.inner.root, &config, limit)
+        let scan_path = config
+            .folder
+            .as_deref()
+            .filter(|folder| !folder.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        match self.resolve_existing_for_read(&scan_path) {
+            Ok(_) => {}
+            Err(VaultError::NoteNotFound(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        }
+        Ok(
+            periodic::list_recent_periodic_notes(&self.inner.root, &config, limit)?
+                .into_iter()
+                .filter(|path| self.resolve_existing_for_read(path).is_ok())
+                .collect(),
+        )
     }
 
     // ── private helpers ────────────────────────────────────────────────
@@ -999,6 +1068,7 @@ mod tests {
             tool_filter: crate::config::ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: vec![],
+            write_patterns: vec![],
         };
 
         let result = Vault::open(&config).await;
@@ -1790,6 +1860,7 @@ mod tests {
             tool_filter: crate::config::ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: vec![],
+            write_patterns: vec![],
         };
 
         let vault = Vault::open(&config)
@@ -1897,8 +1968,162 @@ mod tests {
         }
     }
 
+    fn test_config_with_policy(
+        vault_root: &Path,
+        exclude_patterns: Vec<String>,
+        write_patterns: Vec<String>,
+    ) -> Config {
+        Config {
+            exclude_patterns,
+            write_patterns,
+            ..test_config(vault_root)
+        }
+    }
+
     #[tokio::test]
-    async fn move_into_excluded_dir() {
+    async fn write_policy_keeps_ordinary_file_readable_but_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        std::fs::write(dir.path().join("readable.md"), "# Original\n").unwrap();
+        let config = test_config_with_policy(dir.path(), vec![], vec!["editable.md".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        assert_eq!(
+            vault.read_note(Path::new("readable.md")).unwrap(),
+            "# Original\n"
+        );
+        assert!(matches!(
+            vault.write_note(Path::new("readable.md"), "# Changed\n"),
+            Err(VaultError::PathReadOnly(path)) if path == PathBuf::from("readable.md")
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("readable.md")).unwrap(),
+            "# Original\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_write_exception_allows_create_and_update() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let config = test_config_with_policy(dir.path(), vec![], vec!["editable.md".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        vault
+            .create_note(Path::new("editable.md"), "# Created\n", None)
+            .unwrap();
+        vault
+            .write_note(Path::new("editable.md"), "# Updated\n")
+            .unwrap();
+        assert_eq!(
+            vault.read_note(Path::new("editable.md")).unwrap(),
+            "# Updated\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusion_wins_over_exact_write_exception() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let config = test_config_with_policy(
+            dir.path(),
+            vec!["private/**".into()],
+            vec!["private/editable.md".into()],
+        );
+        let vault = Vault::open(&config).await.unwrap();
+
+        assert!(matches!(
+            vault.write_note(Path::new("private/editable.md"), "secret"),
+            Err(VaultError::PathExcluded(_))
+        ));
+        assert!(!dir.path().join("private/editable.md").exists());
+    }
+
+    #[tokio::test]
+    async fn move_requires_write_permission_for_source_and_destination() {
+        let source_denied_dir = tempfile::tempdir().unwrap();
+        create_test_vault(source_denied_dir.path());
+        std::fs::write(source_denied_dir.path().join("source.md"), "# Source\n").unwrap();
+        let source_denied = Vault::open(&test_config_with_policy(
+            source_denied_dir.path(),
+            vec![],
+            vec!["allowed/**".into()],
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            source_denied.move_note(Path::new("source.md"), Path::new("allowed/new.md")),
+            Err(VaultError::PathReadOnly(_))
+        ));
+        assert!(source_denied_dir.path().join("source.md").exists());
+
+        let destination_denied_dir = tempfile::tempdir().unwrap();
+        create_test_vault(destination_denied_dir.path());
+        std::fs::write(
+            destination_denied_dir.path().join("source.md"),
+            "# Source\n",
+        )
+        .unwrap();
+        let destination_denied = Vault::open(&test_config_with_policy(
+            destination_denied_dir.path(),
+            vec![],
+            vec!["source.md".into(), "allowed/**".into()],
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            destination_denied.move_note(Path::new("source.md"), Path::new("blocked/new.md")),
+            Err(VaultError::PathReadOnly(_))
+        ));
+        assert!(destination_denied_dir.path().join("source.md").exists());
+
+        let moved = destination_denied
+            .move_note(Path::new("source.md"), Path::new("allowed/new.md"))
+            .unwrap();
+        assert_eq!(moved, PathBuf::from("allowed/new.md"));
+        assert!(!destination_denied_dir.path().join("source.md").exists());
+        assert!(
+            destination_denied_dir
+                .path()
+                .join("allowed/new.md")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_alias_and_target_use_stricter_write_permission() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        std::fs::create_dir_all(dir.path().join("targets")).unwrap();
+        std::fs::write(dir.path().join("targets/note.md"), "# Target\n").unwrap();
+        symlink("targets/note.md", dir.path().join("alias.md")).unwrap();
+        let vault = Vault::open(&test_config_with_policy(
+            dir.path(),
+            vec![],
+            vec!["alias.md".into()],
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            vault.read_note(Path::new("alias.md")).unwrap(),
+            "# Target\n"
+        );
+        assert!(matches!(
+            vault.write_note(Path::new("alias.md"), "# Changed\n"),
+            Err(VaultError::PathReadOnly(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("targets/note.md")).unwrap(),
+            "# Target\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_into_excluded_dir_is_denied() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let config = test_config_with_exclusions(dir.path(), vec!["Archive/**".into()]);
@@ -1909,25 +2134,16 @@ mod tests {
             .unwrap();
         assert!(vault.get_note_metadata(Path::new("active.md")).is_ok());
 
-        let new_path = vault
-            .move_note(Path::new("active.md"), Path::new("Archive/archived.md"))
-            .unwrap();
-        assert_eq!(new_path, PathBuf::from("Archive/archived.md"));
-
-        assert!(vault.get_note_metadata(Path::new("active.md")).is_err());
         assert!(
             vault
-                .get_note_metadata(Path::new("Archive/archived.md"))
+                .move_note(Path::new("active.md"), Path::new("Archive/archived.md"))
                 .is_err()
         );
-        assert_eq!(vault.vault_stats().unwrap().excluded_notes, 1);
-
-        let content = vault.read_note(Path::new("Archive/archived.md")).unwrap();
-        assert_eq!(content, "# Active");
+        assert_eq!(vault.read_note(Path::new("active.md")).unwrap(), "# Active");
     }
 
     #[tokio::test]
-    async fn move_out_of_excluded_dir() {
+    async fn move_out_of_excluded_dir_is_denied() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
@@ -1942,22 +2158,16 @@ mod tests {
                 .is_err()
         );
 
-        let new_path = vault
-            .move_note(Path::new("Archive/hidden.md"), Path::new("visible.md"))
-            .unwrap();
-        assert_eq!(new_path, PathBuf::from("visible.md"));
-
-        assert!(vault.get_note_metadata(Path::new("visible.md")).is_ok());
         assert!(
             vault
-                .get_note_metadata(Path::new("Archive/hidden.md"))
+                .move_note(Path::new("Archive/hidden.md"), Path::new("visible.md"))
                 .is_err()
         );
-        assert_eq!(vault.vault_stats().unwrap().excluded_notes, 0);
+        assert!(!dir.path().join("visible.md").exists());
     }
 
     #[tokio::test]
-    async fn move_between_excluded_dirs() {
+    async fn move_between_excluded_dirs_is_denied() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
@@ -1973,24 +2183,16 @@ mod tests {
                 .is_err()
         );
 
-        let new_path = vault
-            .move_note(Path::new("Archive/old.md"), Path::new("Trash/old.md"))
-            .unwrap();
-        assert_eq!(new_path, PathBuf::from("Trash/old.md"));
-
         assert!(
             vault
-                .get_note_metadata(Path::new("Archive/old.md"))
+                .move_note(Path::new("Archive/old.md"), Path::new("Trash/old.md"))
                 .is_err()
         );
-        assert!(vault.get_note_metadata(Path::new("Trash/old.md")).is_err());
-
-        let content = vault.read_note(Path::new("Trash/old.md")).unwrap();
-        assert_eq!(content, "# Old");
+        assert!(!dir.path().join("Trash/old.md").exists());
     }
 
     #[tokio::test]
-    async fn move_into_excluded_dir_with_tantivy() {
+    async fn move_into_excluded_dir_with_tantivy_is_denied() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let config = Config {
@@ -2005,47 +2207,27 @@ mod tests {
             .unwrap();
         assert!(vault.get_note_metadata(Path::new("indexed.md")).is_ok());
 
-        vault
-            .move_note(Path::new("indexed.md"), Path::new("Archive/gone.md"))
-            .unwrap();
-
-        assert!(vault.get_note_metadata(Path::new("indexed.md")).is_err());
         assert!(
             vault
-                .get_note_metadata(Path::new("Archive/gone.md"))
+                .move_note(Path::new("indexed.md"), Path::new("Archive/gone.md"))
                 .is_err()
         );
-
-        let results = vault.search_text("Indexed note", 100).unwrap();
-        assert!(
-            results.is_empty(),
-            "moved-to-excluded note should not appear in search"
-        );
+        assert_eq!(vault.search_text("Indexed note", 100).unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn write_note_to_excluded_path_does_not_index() {
+    async fn write_note_to_excluded_path_is_denied() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let config = test_config_with_exclusions(dir.path(), vec!["Archive/**".into()]);
         let vault = Vault::open(&config).await.unwrap();
 
-        vault
-            .write_note(Path::new("Archive/direct.md"), "# Direct excluded")
-            .unwrap();
-
         assert!(
             vault
-                .get_note_metadata(Path::new("Archive/direct.md"))
+                .write_note(Path::new("Archive/direct.md"), "# Direct excluded")
                 .is_err()
         );
-        assert_eq!(vault.vault_stats().unwrap().excluded_notes, 1);
-        assert_eq!(
-            vault.read_note(Path::new("Archive/direct.md")).unwrap(),
-            "# Direct excluded"
-        );
-
-        vault.delete_note(Path::new("Archive/direct.md")).unwrap();
+        assert!(!dir.path().join("Archive/direct.md").exists());
         assert_eq!(vault.vault_stats().unwrap().excluded_notes, 0);
     }
 
@@ -2132,23 +2314,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hidden_writes_and_moves_remain_outside_indexes() {
+    async fn hidden_writes_and_moves_are_denied() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
-        vault
-            .write_note(Path::new(".secret/hidden.md"), "quokka")
-            .unwrap();
         assert!(
             vault
-                .get_note_metadata(Path::new(".secret/hidden.md"))
+                .write_note(Path::new(".secret/hidden.md"), "quokka")
                 .is_err()
         );
         vault.write_note(Path::new("visible.md"), "quokka").unwrap();
-        vault
-            .move_note(Path::new("visible.md"), Path::new("notes/.hidden.md"))
-            .unwrap();
-        assert!(vault.search_text("quokka", 0).unwrap().is_empty());
-        assert_eq!(vault.vault_stats().unwrap().total_notes, 0);
+        assert!(
+            vault
+                .move_note(Path::new("visible.md"), Path::new("notes/.hidden.md"))
+                .is_err()
+        );
+        assert_eq!(vault.search_text("quokka", 0).unwrap().len(), 1);
+        assert_eq!(vault.vault_stats().unwrap().total_notes, 1);
     }
 
     #[tokio::test]
