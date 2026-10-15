@@ -3,6 +3,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use globset::Glob;
 use walkdir::WalkDir;
@@ -11,10 +12,125 @@ use crate::error::{VaultError, VaultResult};
 use crate::models::FileStat;
 use crate::vault::path as vault_path;
 
+use super::exclude::ExcludeSet;
+use super::path::ResolvedPath;
+use super::policy::AccessPolicy;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MoveResult {
+pub(in crate::vault) struct MoveResult {
     pub from: PathBuf,
     pub to: PathBuf,
+}
+
+/// Policy-enforcing filesystem boundary for vault content.
+///
+/// Callers provide ordinary paths. Resolution, permission checks, and raw I/O
+/// remain inseparable inside this type, so higher-level operations cannot omit
+/// a policy check or operate on a different path from the one authorized.
+#[derive(Clone)]
+pub(crate) struct SafeFs {
+    root: PathBuf,
+    policy: Arc<AccessPolicy>,
+}
+
+impl SafeFs {
+    pub(in crate::vault) fn new(root: PathBuf, policy: Arc<AccessPolicy>) -> Self {
+        Self { root, policy }
+    }
+
+    pub(crate) fn visible_paths(root: PathBuf) -> VaultResult<Self> {
+        let denied = Arc::new(ExcludeSet::build(Vec::new())?);
+        let policy = Arc::new(AccessPolicy::new(denied, Vec::new())?);
+        Ok(Self::new(root, policy))
+    }
+
+    pub(in crate::vault) fn list_files(
+        &self,
+        dir: &Path,
+        recursive: bool,
+        glob: Option<&str>,
+    ) -> VaultResult<Vec<PathBuf>> {
+        let directory = self.resolve_read(dir)?;
+        let mut paths = list_files_resolved(&self.root, &directory, recursive, glob)?
+            .into_iter()
+            .filter_map(|path| {
+                self.resolve_read(&path)
+                    .ok()
+                    .map(|resolved| resolved.relative)
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    pub(crate) fn read_file(&self, path: &Path) -> VaultResult<String> {
+        let resolved = self.resolve_read(path)?;
+        read_resolved(&resolved, path)
+    }
+
+    pub(in crate::vault) fn file_stat(&self, path: &Path) -> VaultResult<FileStat> {
+        let resolved = self.resolve_read(path)?;
+        file_stat_resolved(&resolved, path)
+    }
+
+    pub(in crate::vault) fn write_file(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
+        let resolved = self.resolve_write_target(path)?;
+        write_resolved(&resolved, content)
+    }
+
+    pub(in crate::vault) fn create_file(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
+        let resolved = self.resolve_write_target(path)?;
+        create_resolved(&resolved, path, content)
+    }
+
+    pub(in crate::vault) fn append_file(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
+        let resolved = self.resolve_write_target(path)?;
+        append_resolved(&resolved, content)
+    }
+
+    pub(in crate::vault) fn delete_file(&self, path: &Path) -> VaultResult<PathBuf> {
+        let resolved = self.resolve_write_existing(path)?;
+        delete_resolved(&resolved, path)
+    }
+
+    pub(in crate::vault) fn move_file(&self, from: &Path, to: &Path) -> VaultResult<MoveResult> {
+        let source = self.resolve_write_existing(from)?;
+        let destination = self.resolve_write_target(to)?;
+        move_resolved(&source, &destination, to)
+    }
+
+    pub(crate) fn canonical_existing_relative_path(&self, path: &Path) -> VaultResult<PathBuf> {
+        Ok(self.resolve_read(path)?.relative)
+    }
+
+    pub(in crate::vault) fn validate_read_path(&self, path: &Path) -> VaultResult<()> {
+        self.resolve_read_target(path).map(|_| ())
+    }
+
+    fn resolve_read(&self, path: &Path) -> VaultResult<ResolvedPath> {
+        let resolved = vault_path::resolve_existing(&self.root, path)?;
+        self.policy.authorize_read(&resolved)?;
+        Ok(resolved)
+    }
+
+    fn resolve_read_target(&self, path: &Path) -> VaultResult<ResolvedPath> {
+        let resolved = vault_path::resolve_for_write(&self.root, path)?;
+        self.policy.authorize_read(&resolved)?;
+        Ok(resolved)
+    }
+
+    fn resolve_write_existing(&self, path: &Path) -> VaultResult<ResolvedPath> {
+        let resolved = vault_path::resolve_existing(&self.root, path)?;
+        self.policy.authorize_write(&resolved)?;
+        Ok(resolved)
+    }
+
+    fn resolve_write_target(&self, path: &Path) -> VaultResult<ResolvedPath> {
+        let resolved = vault_path::resolve_for_write(&self.root, path)?;
+        self.policy.authorize_write(&resolved)?;
+        Ok(resolved)
+    }
 }
 
 fn is_hidden(name: &str) -> bool {
@@ -32,21 +148,27 @@ fn map_not_found(path: &Path) -> impl FnOnce(std::io::Error) -> VaultError + '_ 
 ///
 /// For existing paths, canonicalization catches symlink escapes.
 /// For non-existent paths, manual normalization is sufficient.
-pub fn resolve_path(vault_root: &Path, relative: &Path) -> VaultResult<PathBuf> {
+#[cfg(test)]
+fn resolve_path(vault_root: &Path, relative: &Path) -> VaultResult<PathBuf> {
     Ok(vault_path::resolve_for_write(vault_root, relative)?.absolute)
 }
 
 /// Check if path exists and is a file.
-pub fn file_exists(vault_root: &Path, path: &Path) -> bool {
+#[cfg(test)]
+fn file_exists(vault_root: &Path, path: &Path) -> bool {
     vault_path::resolve_existing(vault_root, path)
         .map(|p| p.absolute.is_file())
         .unwrap_or(false)
 }
 
 /// Get file stat (size, created, modified).
-pub fn file_stat(vault_root: &Path, path: &Path) -> VaultResult<FileStat> {
-    let abs = vault_path::resolve_existing(vault_root, path)?.absolute;
-    let meta = fs::metadata(&abs).map_err(map_not_found(path))?;
+pub(in crate::vault) fn file_stat(vault_root: &Path, path: &Path) -> VaultResult<FileStat> {
+    let resolved = vault_path::resolve_existing(vault_root, path)?;
+    file_stat_resolved(&resolved, path)
+}
+
+fn file_stat_resolved(resolved: &ResolvedPath, original: &Path) -> VaultResult<FileStat> {
+    let meta = fs::metadata(&resolved.absolute).map_err(map_not_found(original))?;
 
     let created = meta
         .created()
@@ -65,24 +187,42 @@ pub fn file_stat(vault_root: &Path, path: &Path) -> VaultResult<FileStat> {
 }
 
 /// Read a file's content as a UTF-8 string.
-pub fn read_file(vault_root: &Path, path: &Path) -> VaultResult<String> {
-    let abs = vault_path::resolve_existing(vault_root, path)?.absolute;
-    fs::read_to_string(&abs).map_err(map_not_found(path))
+pub(in crate::vault) fn read_file(vault_root: &Path, path: &Path) -> VaultResult<String> {
+    let resolved = vault_path::resolve_existing(vault_root, path)?;
+    read_resolved(&resolved, path)
+}
+
+fn read_resolved(resolved: &ResolvedPath, original: &Path) -> VaultResult<String> {
+    fs::read_to_string(&resolved.absolute).map_err(map_not_found(original))
 }
 
 /// Write content to a file (creates parent dirs if needed). Overwrites if exists.
-pub fn write_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<PathBuf> {
+#[cfg(test)]
+fn write_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<PathBuf> {
     let resolved = vault_path::resolve_for_write(vault_root, path)?;
+    write_resolved(&resolved, content)
+}
+
+fn write_resolved(resolved: &ResolvedPath, content: &str) -> VaultResult<PathBuf> {
     if let Some(parent) = resolved.absolute.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(&resolved.absolute, content)?;
-    Ok(resolved.relative)
+    Ok(resolved.relative.clone())
 }
 
 /// Create a file without overwriting an existing path, including concurrent creators.
-pub fn create_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<PathBuf> {
+#[cfg(test)]
+fn create_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<PathBuf> {
     let resolved = vault_path::resolve_for_write(vault_root, path)?;
+    create_resolved(&resolved, path, content)
+}
+
+fn create_resolved(
+    resolved: &ResolvedPath,
+    original: &Path,
+    content: &str,
+) -> VaultResult<PathBuf> {
     if let Some(parent) = resolved.absolute.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -91,16 +231,21 @@ pub fn create_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult
         .create_new(true)
         .open(&resolved.absolute)
         .map_err(|error| match error.kind() {
-            std::io::ErrorKind::AlreadyExists => VaultError::AlreadyExists(path.to_path_buf()),
+            std::io::ErrorKind::AlreadyExists => VaultError::AlreadyExists(original.to_path_buf()),
             _ => VaultError::Io(error),
         })?;
     file.write_all(content.as_bytes())?;
-    Ok(resolved.relative)
+    Ok(resolved.relative.clone())
 }
 
 /// Append content to a file. Creates the file if it doesn't exist.
-pub fn append_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<PathBuf> {
+#[cfg(test)]
+fn append_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<PathBuf> {
     let resolved = vault_path::resolve_for_write(vault_root, path)?;
+    append_resolved(&resolved, content)
+}
+
+fn append_resolved(resolved: &ResolvedPath, content: &str) -> VaultResult<PathBuf> {
     if let Some(parent) = resolved.absolute.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -109,26 +254,40 @@ pub fn append_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult
         .append(true)
         .open(&resolved.absolute)?;
     file.write_all(content.as_bytes())?;
-    Ok(resolved.relative)
+    Ok(resolved.relative.clone())
 }
 
 /// Delete a file or empty directory.
-pub fn delete_file(vault_root: &Path, path: &Path) -> VaultResult<PathBuf> {
+#[cfg(test)]
+fn delete_file(vault_root: &Path, path: &Path) -> VaultResult<PathBuf> {
     let resolved = vault_path::resolve_existing(vault_root, path)?;
+    delete_resolved(&resolved, path)
+}
+
+fn delete_resolved(resolved: &ResolvedPath, original: &Path) -> VaultResult<PathBuf> {
     if resolved.absolute.is_dir() {
-        fs::remove_dir(&resolved.absolute).map_err(map_not_found(path))?;
+        fs::remove_dir(&resolved.absolute).map_err(map_not_found(original))?;
     } else {
-        fs::remove_file(&resolved.absolute).map_err(map_not_found(path))?;
+        fs::remove_file(&resolved.absolute).map_err(map_not_found(original))?;
     }
-    Ok(resolved.relative)
+    Ok(resolved.relative.clone())
 }
 
 /// Move/rename a file. Returns the actual source and destination relative paths.
-pub fn move_file(vault_root: &Path, from: &Path, to: &Path) -> VaultResult<MoveResult> {
+#[cfg(test)]
+fn move_file(vault_root: &Path, from: &Path, to: &Path) -> VaultResult<MoveResult> {
     let resolved_from = vault_path::resolve_existing(vault_root, from)?;
     let resolved_to = vault_path::resolve_for_write(vault_root, to)?;
+    move_resolved(&resolved_from, &resolved_to, to)
+}
+
+fn move_resolved(
+    resolved_from: &ResolvedPath,
+    resolved_to: &ResolvedPath,
+    original_to: &Path,
+) -> VaultResult<MoveResult> {
     if resolved_to.absolute.exists() {
-        return Err(VaultError::AlreadyExists(to.to_path_buf()));
+        return Err(VaultError::AlreadyExists(original_to.to_path_buf()));
     }
 
     if let Some(parent) = resolved_to.absolute.parent() {
@@ -137,8 +296,8 @@ pub fn move_file(vault_root: &Path, from: &Path, to: &Path) -> VaultResult<MoveR
     fs::rename(&resolved_from.absolute, &resolved_to.absolute)?;
 
     Ok(MoveResult {
-        from: resolved_from.relative,
-        to: resolved_to.relative,
+        from: resolved_from.relative.clone(),
+        to: resolved_to.relative.clone(),
     })
 }
 
@@ -147,20 +306,29 @@ pub fn move_file(vault_root: &Path, from: &Path, to: &Path) -> VaultResult<MoveR
 /// If `recursive` is true, walks the entire subtree.
 /// If `glob` is Some, filters results by glob pattern.
 /// Hidden files and `.obsidian/` are excluded.
-pub fn list_files(
+#[cfg(test)]
+fn list_files(
     vault_root: &Path,
     dir: &Path,
     recursive: bool,
     glob: Option<&str>,
 ) -> VaultResult<Vec<PathBuf>> {
-    let abs_dir = vault_path::resolve_existing(vault_root, dir)
-        .map_err(|err| match err {
-            VaultError::NoteNotFound(_) => VaultError::DirectoryNotFound(dir.to_path_buf()),
-            other => other,
-        })?
-        .absolute;
+    let resolved = vault_path::resolve_existing(vault_root, dir).map_err(|err| match err {
+        VaultError::NoteNotFound(_) => VaultError::DirectoryNotFound(dir.to_path_buf()),
+        other => other,
+    })?;
+    list_files_resolved(vault_root, &resolved, recursive, glob)
+}
+
+fn list_files_resolved(
+    vault_root: &Path,
+    directory: &ResolvedPath,
+    recursive: bool,
+    glob: Option<&str>,
+) -> VaultResult<Vec<PathBuf>> {
+    let abs_dir = &directory.absolute;
     if !abs_dir.is_dir() {
-        return Err(VaultError::DirectoryNotFound(dir.to_path_buf()));
+        return Err(VaultError::DirectoryNotFound(directory.relative.clone()));
     }
 
     let canonical_root = vault_root
@@ -237,6 +405,83 @@ mod tests {
         .unwrap();
         fs::write(dir.path().join(".hidden_file"), "secret").unwrap();
         dir
+    }
+
+    fn safe_fs(vault: &TempDir, denied: &[&str], writable: &[&str]) -> SafeFs {
+        let denied = Arc::new(
+            ExcludeSet::build(denied.iter().map(|value| (*value).to_owned()).collect()).unwrap(),
+        );
+        let policy = Arc::new(
+            AccessPolicy::new(
+                denied,
+                writable.iter().map(|value| (*value).to_owned()).collect(),
+            )
+            .unwrap(),
+        );
+        SafeFs::new(vault.path().canonicalize().unwrap(), policy)
+    }
+
+    // ── SafeFs policy boundary ──
+
+    #[test]
+    fn safe_fs_enforces_policy_for_reads_and_writes() {
+        let vault = setup_vault();
+        let fs = safe_fs(&vault, &["subfolder/**"], &["note1.md"]);
+
+        assert_eq!(
+            fs.read_file(Path::new("note2.md")).unwrap(),
+            "# Note 2\nWorld"
+        );
+        assert!(matches!(
+            fs.read_file(Path::new("subfolder/nested.md")),
+            Err(VaultError::PathExcluded(path))
+                if path == PathBuf::from("subfolder/nested.md")
+        ));
+        assert!(matches!(
+            fs.write_file(Path::new("note2.md"), "changed"),
+            Err(VaultError::PathReadOnly(path)) if path == PathBuf::from("note2.md")
+        ));
+
+        fs.write_file(Path::new("note1.md"), "changed").unwrap();
+        assert_eq!(fs.read_file(Path::new("note1.md")).unwrap(), "changed");
+    }
+
+    #[test]
+    fn safe_fs_move_requires_both_source_and_destination_write_permission() {
+        let source_only_vault = setup_vault();
+        let source_only = safe_fs(&source_only_vault, &[], &["note1.md"]);
+        assert!(matches!(
+            source_only.move_file(Path::new("note1.md"), Path::new("moved.md")),
+            Err(VaultError::PathReadOnly(path)) if path == PathBuf::from("moved.md")
+        ));
+        assert!(source_only_vault.path().join("note1.md").exists());
+
+        let destination_only_vault = setup_vault();
+        let destination_only = safe_fs(&destination_only_vault, &[], &["moved.md"]);
+        assert!(matches!(
+            destination_only.move_file(Path::new("note1.md"), Path::new("moved.md")),
+            Err(VaultError::PathReadOnly(path)) if path == PathBuf::from("note1.md")
+        ));
+        assert!(destination_only_vault.path().join("note1.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_fs_policy_matches_the_resolved_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let vault = setup_vault();
+        fs::create_dir_all(vault.path().join("targets")).unwrap();
+        fs::write(vault.path().join("targets/note.md"), "original").unwrap();
+        symlink("targets/note.md", vault.path().join("alias.md")).unwrap();
+        let fs = safe_fs(&vault, &["alias.md"], &["targets/note.md"]);
+
+        fs.write_file(Path::new("alias.md"), "changed").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(vault.path().join("targets/note.md")).unwrap(),
+            "changed"
+        );
     }
 
     // ── resolve_path ──

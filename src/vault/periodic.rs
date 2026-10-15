@@ -507,6 +507,7 @@ fn try_parse_quarter_date(stem: &str, chrono_fmt: &str) -> Option<NaiveDate> {
 /// `{{date}}`, `{{date:FORMAT}}`, `{{title}}`, `{{time}}`.
 ///
 /// If `template_path` has no file extension, `.md` is appended automatically.
+#[cfg(test)]
 pub fn expand_template(
     vault_root: &Path,
     template_path: &Path,
@@ -525,13 +526,17 @@ pub fn expand_template(
         _ => VaultError::Io(e),
     })?;
 
-    expand_template_string(&content, date, title)
+    expand_template_content(&content, date, title)
 }
 
 static DATE_FORMAT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\{\{date:([^}]+)\}\}").unwrap());
 
-fn expand_template_string(content: &str, date: &NaiveDate, title: &str) -> VaultResult<String> {
+pub(crate) fn expand_template_content(
+    content: &str,
+    date: &NaiveDate,
+    title: &str,
+) -> VaultResult<String> {
     let mut result = String::with_capacity(content.len());
     let mut cursor = 0;
     for captures in DATE_FORMAT_RE.captures_iter(content) {
@@ -974,28 +979,28 @@ mod tests {
     #[test]
     fn template_title_replacement() {
         let d = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-        let result = expand_template_string("Hello {{title}}!", &d, "World").unwrap();
+        let result = expand_template_content("Hello {{title}}!", &d, "World").unwrap();
         assert_eq!(result, "Hello World!");
     }
 
     #[test]
     fn template_date_replacement() {
         let d = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
-        let result = expand_template_string("Date: {{date}}", &d, "").unwrap();
+        let result = expand_template_content("Date: {{date}}", &d, "").unwrap();
         assert_eq!(result, "Date: 2026-03-19");
     }
 
     #[test]
     fn template_date_with_custom_format() {
         let d = NaiveDate::from_ymd_opt(2026, 12, 25).unwrap();
-        let result = expand_template_string("{{date:MMMM DD, YYYY}}", &d, "").unwrap();
+        let result = expand_template_content("{{date:MMMM DD, YYYY}}", &d, "").unwrap();
         assert_eq!(result, "December 25, 2026");
     }
 
     #[test]
     fn template_time_has_hh_mm_pattern() {
         let d = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-        let result = expand_template_string("Time: {{time}}", &d, "").unwrap();
+        let result = expand_template_content("Time: {{time}}", &d, "").unwrap();
         let time_part = result.strip_prefix("Time: ").unwrap();
         assert_eq!(time_part.len(), 5);
         assert_eq!(&time_part[2..3], ":");
@@ -1004,7 +1009,7 @@ mod tests {
     #[test]
     fn template_combined_variables() {
         let d = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
-        let result = expand_template_string(
+        let result = expand_template_content(
             "# {{title}}\nDate: {{date}}\n{{date:dddd, MMMM D}}",
             &d,
             "2026-03-19",
@@ -1068,7 +1073,7 @@ mod tests {
             "2026-09-08 100%"
         );
         assert_eq!(
-            expand_template_string("{{date:[100%] YYYY}}", &date, "").unwrap(),
+            expand_template_content("{{date:[100%] YYYY}}", &date, "").unwrap(),
             "100% 2026"
         );
     }
@@ -1080,6 +1085,6 @@ mod tests {
             format_date(&date, "YYYY-MM-DD HH:mm"),
             Err(VaultError::InvalidDateFormat { .. })
         ));
-        assert!(expand_template_string("{{date:HH:mm}}", &date, "").is_err());
+        assert!(expand_template_content("{{date:HH:mm}}", &date, "").is_err());
     }
 }

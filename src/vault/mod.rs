@@ -5,13 +5,13 @@
 
 pub mod exclude;
 pub mod frontmatter;
-pub mod fs;
+pub(crate) mod fs;
 pub mod index;
 pub mod parser;
 pub mod patch;
-pub mod path;
+pub(crate) mod path;
 pub mod periodic;
-pub mod policy;
+pub(crate) mod policy;
 pub mod search_utils;
 pub mod tantivy_index;
 pub mod watcher;
@@ -36,8 +36,8 @@ use crate::models::{
 };
 
 use self::exclude::ExcludeSet;
+use self::fs::SafeFs;
 use self::index::VaultIndex;
-use self::path::ResolvedPath;
 use self::policy::AccessPolicy;
 use self::tantivy_index::TantivyIndex;
 use self::watcher::ChangeWatcher;
@@ -59,7 +59,7 @@ struct VaultInner {
     mcp_home: PathBuf,
     mcp_data: PathBuf,
     exclude: Arc<ExcludeSet>,
-    access_policy: AccessPolicy,
+    safe_fs: SafeFs,
     index: Arc<RwLock<VaultIndex>>,
     mutations: Mutex<()>,
     tantivy: Option<Arc<TantivyIndex>>,
@@ -168,7 +168,11 @@ impl Vault {
         patterns.dedup();
 
         let exclude = Arc::new(exclude::ExcludeSet::build(patterns)?);
-        let access_policy = AccessPolicy::new(Arc::clone(&exclude), config.write_patterns.clone())?;
+        let access_policy = Arc::new(AccessPolicy::new(
+            Arc::clone(&exclude),
+            config.write_patterns.clone(),
+        )?);
+        let safe_fs = SafeFs::new(root.clone(), access_policy);
 
         if !exclude.is_empty() {
             tracing::info!(
@@ -245,7 +249,7 @@ impl Vault {
                 mcp_home,
                 mcp_data,
                 exclude,
-                access_policy,
+                safe_fs,
                 index,
                 mutations: Mutex::new(()),
                 tantivy,
@@ -289,42 +293,34 @@ impl Vault {
         recursive: bool,
         glob: Option<&str>,
     ) -> VaultResult<Vec<PathBuf>> {
-        self.resolve_existing_for_read(dir)?;
-        Ok(fs::list_files(&self.inner.root, dir, recursive, glob)?
-            .into_iter()
-            .filter(|path| self.resolve_existing_for_read(path).is_ok())
-            .collect())
+        self.inner.safe_fs.list_files(dir, recursive, glob)
     }
 
     pub fn read_note(&self, path: &Path) -> VaultResult<String> {
-        self.resolve_existing_for_read(path)?;
-        fs::read_file(&self.inner.root, path)
+        self.inner.safe_fs.read_file(path)
     }
 
     pub fn file_stat(&self, path: &Path) -> VaultResult<FileStat> {
-        self.resolve_existing_for_read(path)?;
-        fs::file_stat(&self.inner.root, path)
+        self.inner.safe_fs.file_stat(path)
     }
 
     pub fn write_note(&self, path: &Path, content: &str) -> VaultResult<()> {
-        self.resolve_destination_for_write(path)?;
         let _mutation = self.lock_mutations()?;
         frontmatter::parse_frontmatter(content)?;
-        let actual_path = fs::write_file(&self.inner.root, path, content)?;
+        let actual_path = self.inner.safe_fs.write_file(path, content)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn append_note(&self, path: &Path, content: &str) -> VaultResult<()> {
-        self.resolve_destination_for_write(path)?;
         let _mutation = self.lock_mutations()?;
-        let combined = match fs::read_file(&self.inner.root, path) {
+        let combined = match self.inner.safe_fs.read_file(path) {
             Ok(existing) => existing + content,
             Err(VaultError::NoteNotFound(_)) => content.to_owned(),
             Err(error) => return Err(error),
         };
         frontmatter::parse_frontmatter(&combined)?;
-        let actual_path = fs::append_file(&self.inner.root, path, content)?;
+        let actual_path = self.inner.safe_fs.append_file(path, content)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
@@ -337,7 +333,6 @@ impl Vault {
         content: &str,
         frontmatter: Option<&serde_json::Value>,
     ) -> VaultResult<()> {
-        self.resolve_destination_for_write(path)?;
         let _mutation = self.lock_mutations()?;
         if let Some(value) = frontmatter
             && !value.is_object()
@@ -349,16 +344,15 @@ impl Vault {
         }
         let full_content = frontmatter::rebuild_content(frontmatter, content);
         frontmatter::parse_frontmatter(&full_content)?;
-        let actual_path = fs::create_file(&self.inner.root, path, &full_content)?;
+        let actual_path = self.inner.safe_fs.create_file(path, &full_content)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     /// Prepend content after frontmatter (or at the start if none exists).
     pub fn prepend_note(&self, path: &Path, content: &str) -> VaultResult<()> {
-        self.resolve_existing_for_write(path)?;
         let _mutation = self.lock_mutations()?;
-        let existing = fs::read_file(&self.inner.root, path)?;
+        let existing = self.inner.safe_fs.read_file(path)?;
         let new_content = match frontmatter::extract_raw_frontmatter(&existing) {
             Some((_, body_start)) => {
                 let mut result = String::with_capacity(existing.len() + content.len());
@@ -370,15 +364,14 @@ impl Vault {
             None => format!("{content}{existing}"),
         };
         frontmatter::parse_frontmatter(&new_content)?;
-        let actual_path = fs::write_file(&self.inner.root, path, &new_content)?;
+        let actual_path = self.inner.safe_fs.write_file(path, &new_content)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn delete_note(&self, path: &Path) -> VaultResult<()> {
-        self.resolve_existing_for_write(path)?;
         let _mutation = self.lock_mutations()?;
-        let actual_path = fs::delete_file(&self.inner.root, path)?;
+        let actual_path = self.inner.safe_fs.delete_file(path)?;
         self.write_index().remove_file(&actual_path);
         if let Some(tv) = &self.inner.tantivy {
             tv.remove_file(&actual_path)?;
@@ -391,10 +384,8 @@ impl Vault {
     }
 
     pub fn move_note(&self, from: &Path, to: &Path) -> VaultResult<PathBuf> {
-        self.resolve_existing_for_write(from)?;
-        self.resolve_destination_for_write(to)?;
         let _mutation = self.lock_mutations()?;
-        let move_result = fs::move_file(&self.inner.root, from, to)?;
+        let move_result = self.inner.safe_fs.move_file(from, to)?;
         let old_path = move_result.from;
         let new_path = move_result.to;
 
@@ -414,12 +405,11 @@ impl Vault {
     // ── patch delegation ───────────────────────────────────────────────
 
     pub fn patch_note(&self, path: &Path, request: &PatchRequest) -> VaultResult<()> {
-        self.resolve_existing_for_write(path)?;
         let _mutation = self.lock_mutations()?;
-        let content = fs::read_file(&self.inner.root, path)?;
+        let content = self.inner.safe_fs.read_file(path)?;
         let patched = patch::apply_patch(&content, request, path)?;
         frontmatter::parse_frontmatter(&patched)?;
-        let actual_path = fs::write_file(&self.inner.root, path, &patched)?;
+        let actual_path = self.inner.safe_fs.write_file(path, &patched)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
@@ -427,8 +417,7 @@ impl Vault {
     // ── frontmatter delegation ─────────────────────────────────────────
 
     pub fn get_frontmatter(&self, path: &Path) -> VaultResult<Option<serde_json::Value>> {
-        self.resolve_existing_for_read(path)?;
-        let content = fs::read_file(&self.inner.root, path)?;
+        let content = self.inner.safe_fs.read_file(path)?;
         frontmatter::parse_frontmatter(&content)
     }
 
@@ -438,23 +427,21 @@ impl Vault {
         key: &str,
         value: serde_json::Value,
     ) -> VaultResult<()> {
-        self.resolve_existing_for_write(path)?;
         let _mutation = self.lock_mutations()?;
-        let content = fs::read_file(&self.inner.root, path)?;
+        let content = self.inner.safe_fs.read_file(path)?;
         let updated = frontmatter::set_frontmatter_field(&content, key, value)?;
         frontmatter::parse_frontmatter(&updated)?;
-        let actual_path = fs::write_file(&self.inner.root, path, &updated)?;
+        let actual_path = self.inner.safe_fs.write_file(path, &updated)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn remove_frontmatter_field(&self, path: &Path, key: &str) -> VaultResult<()> {
-        self.resolve_existing_for_write(path)?;
         let _mutation = self.lock_mutations()?;
-        let content = fs::read_file(&self.inner.root, path)?;
+        let content = self.inner.safe_fs.read_file(path)?;
         let updated = frontmatter::remove_frontmatter_field(&content, key)?;
         frontmatter::parse_frontmatter(&updated)?;
-        let actual_path = fs::write_file(&self.inner.root, path, &updated)?;
+        let actual_path = self.inner.safe_fs.write_file(path, &updated)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
@@ -500,8 +487,7 @@ impl Vault {
     }
 
     pub fn get_document_map(&self, path: &Path) -> VaultResult<DocumentMap> {
-        self.resolve_existing_for_read(path)?;
-        let content = fs::read_file(&self.inner.root, path)?;
+        let content = self.inner.safe_fs.read_file(path)?;
         Ok(parser::build_document_map(&content))
     }
 
@@ -756,33 +742,12 @@ impl Vault {
     }
 
     pub(crate) fn canonical_existing_relative_path(&self, path: &Path) -> VaultResult<PathBuf> {
-        let resolved = self.resolve_existing_for_read(path)?;
-        Ok(resolved.relative)
+        self.inner.safe_fs.canonical_existing_relative_path(path)
     }
 
     /// Validate that a relative path stays inside the vault and is visible under policy.
     pub fn validate_path(&self, path: &Path) -> VaultResult<()> {
-        let resolved = path::resolve_for_write(&self.inner.root, path)?;
-        self.inner.access_policy.authorize_read(&resolved)?;
-        Ok(())
-    }
-
-    fn resolve_existing_for_read(&self, path: &Path) -> VaultResult<ResolvedPath> {
-        let resolved = path::resolve_existing(&self.inner.root, path)?;
-        self.inner.access_policy.authorize_read(&resolved)?;
-        Ok(resolved)
-    }
-
-    fn resolve_existing_for_write(&self, path: &Path) -> VaultResult<ResolvedPath> {
-        let resolved = path::resolve_existing(&self.inner.root, path)?;
-        self.inner.access_policy.authorize_write(&resolved)?;
-        Ok(resolved)
-    }
-
-    fn resolve_destination_for_write(&self, path: &Path) -> VaultResult<ResolvedPath> {
-        let resolved = path::resolve_for_write(&self.inner.root, path)?;
-        self.inner.access_policy.authorize_write(&resolved)?;
-        Ok(resolved)
+        self.inner.safe_fs.validate_read_path(path)
     }
 
     // ── periodic delegation ────────────────────────────────────────────
@@ -795,8 +760,7 @@ impl Vault {
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
         let path = periodic::periodic_note_path(&config, &date)?;
-        self.resolve_existing_for_read(&path)?;
-        fs::read_file(&self.inner.root, &path)
+        self.inner.safe_fs.read_file(&path)
     }
 
     pub fn create_periodic_note(
@@ -809,8 +773,6 @@ impl Vault {
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
         let path = periodic::periodic_note_path(&config, &date)?;
-        self.resolve_destination_for_write(&path)?;
-
         let content = if let Some(custom) = content_override {
             custom.to_owned()
         } else {
@@ -822,14 +784,12 @@ impl Vault {
                     } else {
                         template_path
                     };
-                    self.resolve_existing_for_read(&template_path)?;
                     let title = path
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or_default();
-                    match periodic::expand_template(&self.inner.root, Path::new(tmpl), &date, title)
-                    {
-                        Ok(c) => c,
+                    match self.inner.safe_fs.read_file(&template_path) {
+                        Ok(template) => periodic::expand_template_content(&template, &date, title)?,
                         Err(VaultError::NoteNotFound(_)) => String::new(),
                         Err(e) => return Err(e),
                     }
@@ -839,7 +799,7 @@ impl Vault {
         };
 
         frontmatter::parse_frontmatter(&content)?;
-        let actual_path = fs::create_file(&self.inner.root, &path, &content)?;
+        let actual_path = self.inner.safe_fs.create_file(&path, &content)?;
         self.reindex(&actual_path)?;
         Ok(actual_path)
     }
@@ -856,7 +816,11 @@ impl Vault {
             .filter(|folder| !folder.is_empty())
             .map(PathBuf::from)
             .unwrap_or_default();
-        match self.resolve_existing_for_read(&scan_path) {
+        match self
+            .inner
+            .safe_fs
+            .canonical_existing_relative_path(&scan_path)
+        {
             Ok(_) => {}
             Err(VaultError::NoteNotFound(_)) => return Ok(Vec::new()),
             Err(error) => return Err(error),
@@ -864,7 +828,12 @@ impl Vault {
         Ok(
             periodic::list_recent_periodic_notes(&self.inner.root, &config, limit)?
                 .into_iter()
-                .filter(|path| self.resolve_existing_for_read(path).is_ok())
+                .filter(|path| {
+                    self.inner
+                        .safe_fs
+                        .canonical_existing_relative_path(path)
+                        .is_ok()
+                })
                 .collect(),
         )
     }
@@ -898,7 +867,7 @@ impl Vault {
 
         let mut results = Vec::with_capacity(hits.len());
         for (path, score) in hits {
-            let matches = match (word_re.as_ref(), fs::read_file(&self.inner.root, &path)) {
+            let matches = match (word_re.as_ref(), self.inner.safe_fs.read_file(&path)) {
                 (Some(re), Ok(content)) if context_len > 0 => re
                     .find_iter(&content)
                     .map(|m| {
@@ -2092,7 +2061,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn symlink_alias_and_target_use_stricter_write_permission() {
+    async fn symlink_policy_uses_resolved_target_path() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2102,8 +2071,8 @@ mod tests {
         symlink("targets/note.md", dir.path().join("alias.md")).unwrap();
         let vault = Vault::open(&test_config_with_policy(
             dir.path(),
-            vec![],
             vec!["alias.md".into()],
+            vec!["targets/note.md".into()],
         ))
         .await
         .unwrap();
@@ -2112,13 +2081,12 @@ mod tests {
             vault.read_note(Path::new("alias.md")).unwrap(),
             "# Target\n"
         );
-        assert!(matches!(
-            vault.write_note(Path::new("alias.md"), "# Changed\n"),
-            Err(VaultError::PathReadOnly(_))
-        ));
+        vault
+            .write_note(Path::new("alias.md"), "# Changed\n")
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("targets/note.md")).unwrap(),
-            "# Target\n"
+            "# Changed\n"
         );
     }
 

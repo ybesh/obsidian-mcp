@@ -9,14 +9,11 @@ use crate::error::{VaultError, VaultResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPath {
-    /// Normalized spelling supplied by the caller.
-    pub requested: PathBuf,
-    /// Actual on-disk spelling reached while walking the vault.
+    /// Canonical vault-relative path. Existing symlinks have been resolved;
+    /// for a missing target, every existing parent has been resolved.
     pub relative: PathBuf,
+    /// Canonical absolute path used for I/O.
     pub absolute: PathBuf,
-    /// Vault-relative path after resolving symlinks (or the nearest existing
-    /// parent for a destination that does not exist yet).
-    pub canonical_relative: PathBuf,
 }
 
 /// Normalize a vault-relative path, rejecting absolute paths and root escapes.
@@ -62,15 +59,12 @@ pub fn resolve_existing(vault_root: &Path, relative: &Path) -> VaultResult<Resol
 
     if normalized.as_os_str().is_empty() {
         return Ok(ResolvedPath {
-            requested: normalized,
             relative: PathBuf::new(),
-            absolute: canonical_root.clone(),
-            canonical_relative: PathBuf::new(),
+            absolute: canonical_root,
         });
     }
 
     let mut absolute = canonical_root.clone();
-    let mut actual_relative = PathBuf::new();
 
     for component in normal_components(&normalized) {
         let entry_name = match find_component(&absolute, &component, relative)? {
@@ -78,18 +72,12 @@ pub fn resolve_existing(vault_root: &Path, relative: &Path) -> VaultResult<Resol
             None => return Err(VaultError::NoteNotFound(relative.to_path_buf())),
         };
         absolute.push(&entry_name);
-        actual_relative.push(&entry_name);
         ensure_inside_root(&canonical_root, &absolute, relative)?;
     }
 
-    let canonical_absolute = absolute.canonicalize()?;
-    let canonical_relative = relative_from_absolute(&canonical_root, &canonical_absolute)?;
-    Ok(ResolvedPath {
-        requested: normalized,
-        relative: forward_slash_path(&actual_relative),
-        absolute,
-        canonical_relative,
-    })
+    let absolute = absolute.canonicalize()?;
+    let relative = relative_from_absolute(&canonical_root, &absolute)?;
+    Ok(ResolvedPath { relative, absolute })
 }
 
 /// Resolve a write target, preserving existing component spellings and the new
@@ -106,69 +94,35 @@ pub fn resolve_for_write(vault_root: &Path, relative: &Path) -> VaultResult<Reso
 
     if normalized.as_os_str().is_empty() {
         return Ok(ResolvedPath {
-            requested: normalized,
             relative: PathBuf::new(),
-            absolute: canonical_root.clone(),
-            canonical_relative: PathBuf::new(),
+            absolute: canonical_root,
         });
     }
 
     let components = normal_components(&normalized);
     let mut absolute = canonical_root.clone();
-    let mut actual_relative = PathBuf::new();
 
     for (index, component) in components.iter().enumerate() {
         match find_component(&absolute, component, relative)? {
             Some(entry_name) => {
                 absolute.push(&entry_name);
-                actual_relative.push(&entry_name);
                 ensure_inside_root(&canonical_root, &absolute, relative)?;
             }
             None => {
                 absolute.push(component);
-                actual_relative.push(component);
                 for remaining in components.iter().skip(index + 1) {
                     absolute.push(remaining);
-                    actual_relative.push(remaining);
                 }
-                let canonical_relative =
-                    canonical_destination_relative(&canonical_root, &absolute, relative)?;
-                return Ok(ResolvedPath {
-                    requested: normalized,
-                    relative: forward_slash_path(&actual_relative),
-                    absolute,
-                    canonical_relative,
-                });
+                let absolute = canonical_destination(&canonical_root, &absolute, relative)?;
+                let relative = relative_from_absolute(&canonical_root, &absolute)?;
+                return Ok(ResolvedPath { relative, absolute });
             }
         }
     }
 
-    let canonical_absolute = absolute.canonicalize()?;
-    let canonical_relative = relative_from_absolute(&canonical_root, &canonical_absolute)?;
-    Ok(ResolvedPath {
-        requested: normalized,
-        relative: forward_slash_path(&actual_relative),
-        absolute,
-        canonical_relative,
-    })
-}
-
-pub fn resolve_parent_for_write(
-    vault_root: &Path,
-    relative: &Path,
-) -> VaultResult<(PathBuf, PathBuf)> {
-    let resolved = resolve_for_write(vault_root, relative)?;
-    let parent_abs = resolved
-        .absolute
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| resolved.absolute.clone());
-    let parent_rel = resolved
-        .relative
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
-    Ok((forward_slash_path(&parent_rel), parent_abs))
+    let absolute = absolute.canonicalize()?;
+    let relative = relative_from_absolute(&canonical_root, &absolute)?;
+    Ok(ResolvedPath { relative, absolute })
 }
 
 fn canonical_root(vault_root: &Path) -> VaultResult<PathBuf> {
@@ -238,7 +192,7 @@ fn ensure_inside_root(
     Ok(())
 }
 
-fn canonical_destination_relative(
+fn canonical_destination(
     canonical_root: &Path,
     absolute: &Path,
     original_path: &Path,
@@ -252,7 +206,7 @@ fn canonical_destination_relative(
     let suffix = absolute
         .strip_prefix(&parent)
         .map_err(|_| VaultError::OutsideVault(original_path.to_path_buf()))?;
-    relative_from_absolute(canonical_root, &canonical_parent.join(suffix))
+    Ok(canonical_parent.join(suffix))
 }
 
 fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
@@ -306,9 +260,7 @@ mod tests {
         std::fs::write(vault.path().join(&disk_path), "# License\n").unwrap();
 
         let resolved = resolve_existing(vault.path(), Path::new(composed)).unwrap();
-        assert_eq!(resolved.requested, PathBuf::from(composed));
         assert_eq!(resolved.relative, disk_path);
-        assert_eq!(resolved.canonical_relative, disk_path);
         assert!(resolved.absolute.is_file());
     }
 
@@ -338,13 +290,11 @@ mod tests {
 
         let resolved = resolve_for_write(vault.path(), path).unwrap();
         assert_eq!(resolved.relative, path);
-        assert_eq!(resolved.requested, path);
-        assert_eq!(resolved.canonical_relative, path);
     }
 
     #[cfg(unix)]
     #[test]
-    fn resolve_existing_records_symlink_target() {
+    fn resolve_existing_returns_symlink_target() {
         use std::os::unix::fs::symlink;
 
         let vault = setup_vault();
@@ -353,11 +303,10 @@ mod tests {
         symlink("targets/note.md", vault.path().join("alias.md")).unwrap();
 
         let resolved = resolve_existing(vault.path(), Path::new("alias.md")).unwrap();
-        assert_eq!(resolved.requested, PathBuf::from("alias.md"));
-        assert_eq!(resolved.relative, PathBuf::from("alias.md"));
+        assert_eq!(resolved.relative, PathBuf::from("targets/note.md"));
         assert_eq!(
-            resolved.canonical_relative,
-            PathBuf::from("targets/note.md")
+            resolved.absolute,
+            vault.path().canonicalize().unwrap().join("targets/note.md")
         );
     }
 
@@ -371,8 +320,11 @@ mod tests {
         symlink("targets", vault.path().join("alias-dir")).unwrap();
 
         let resolved = resolve_for_write(vault.path(), Path::new("alias-dir/new.md")).unwrap();
-        assert_eq!(resolved.relative, PathBuf::from("alias-dir/new.md"));
-        assert_eq!(resolved.canonical_relative, PathBuf::from("targets/new.md"));
+        assert_eq!(resolved.relative, PathBuf::from("targets/new.md"));
+        assert_eq!(
+            resolved.absolute,
+            vault.path().canonicalize().unwrap().join("targets/new.md")
+        );
     }
 
     #[test]

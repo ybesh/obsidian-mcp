@@ -596,6 +596,11 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `OBSIDIAN_HYBRID_ALPHA` | No | alias | Backward-compatible alias for `OBSIDIAN_SEMANTIC_ALPHA` |
 | `FASTEMBED_CACHE_DIR` | No | `<semantic-home>/model/fastembed-cache` | Daemon-internal shared fastembed cache root |
 
+Vault path policy is enforced at the filesystem boundary rather than in individual MCP tools.
+Paths are resolved to their canonical vault-relative target (including symlinks) before exclusion
+and writable-path predicates are evaluated, and the authorized resolved path is the path used for
+I/O. A move requires write permission for both its resolved source and destination.
+
 \* Also accepted as the first CLI argument: `obsidian-mcp /path/to/vault`
 
 ## Architecture

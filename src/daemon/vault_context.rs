@@ -8,6 +8,7 @@ use notify_debouncer_mini::Debouncer;
 use crate::error::{VaultError, VaultResult};
 use crate::models::NoteMetadata;
 use crate::vault::exclude::ExcludeSet;
+use crate::vault::fs::SafeFs;
 use crate::vault::index::VaultIndex;
 use crate::vault::tantivy_index::TantivyIndex;
 use crate::vault::watcher::ChangeWatcher;
@@ -27,6 +28,7 @@ pub(crate) type EmbeddingLoaderFuture = std::pin::Pin<
 pub struct VaultContext {
     vault_id: String,
     vault_root: PathBuf,
+    safe_fs: SafeFs,
     model_name: String,
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Arc<TantivyIndex>,
@@ -78,9 +80,11 @@ impl VaultContext {
             )
         };
 
+        let safe_fs = SafeFs::visible_paths(vault_root.clone())?;
         let context = Self {
             vault_id,
             vault_root,
+            safe_fs,
             model_name,
             index,
             tantivy,
@@ -161,11 +165,11 @@ impl VaultContext {
     }
 
     pub fn read_note(&self, path: &Path) -> VaultResult<String> {
-        crate::vault::fs::read_file(&self.vault_root, path)
+        self.safe_fs.read_file(path)
     }
 
     pub fn canonical_existing_relative_path(&self, path: &Path) -> VaultResult<PathBuf> {
-        Ok(crate::vault::path::resolve_existing(&self.vault_root, path)?.relative)
+        self.safe_fs.canonical_existing_relative_path(path)
     }
 
     pub fn search_bm25(
