@@ -23,6 +23,18 @@ use crate::client::semantic_daemon::SemanticDaemonClient;
 use crate::config::SemanticMode;
 use crate::vault::Vault;
 
+const DEFAULT_SERVER_INSTRUCTIONS: &str = "Obsidian vault MCP server. Provides tools to read, write, search, and navigate your Obsidian notes via direct filesystem access.";
+
+fn server_instructions_from_env() -> String {
+    resolve_server_instructions(std::env::var("OBSIDIAN_MCP_INSTRUCTIONS").ok())
+}
+
+fn resolve_server_instructions(configured: Option<String>) -> String {
+    configured
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_SERVER_INSTRUCTIONS.to_string())
+}
+
 /// JSON Schema for a value that may be any JSON type.
 ///
 /// `serde_json::Value` deliberately emits an unconstrained schema in Schemars,
@@ -85,6 +97,7 @@ pub struct ObsidianMcp {
     vault: Vault,
     hybrid_alpha: f32,
     semantic_runtime: SemanticRuntime,
+    server_instructions: String,
     pub tool_router: ToolRouter<Self>,
 }
 
@@ -111,6 +124,7 @@ impl ObsidianMcp {
             vault,
             hybrid_alpha,
             semantic_runtime,
+            server_instructions: server_instructions_from_env(),
         }
     }
 
@@ -135,7 +149,7 @@ impl ObsidianMcp {
         name = "note_read",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
         output_schema = schema_for_output::<output::TextOutput>(),
-        description = "Read the full content of a note. Returns the raw markdown including frontmatter."
+        description = "Read the full content of a note by exact vault-relative path. Returns the raw markdown including frontmatter. The path `AGENT.md` selects only the root-level note; a nested note with the same filename requires its explicit path, for example `my_projects/example/AGENT.md`."
     )]
     async fn note_read(
         &self,
@@ -399,10 +413,7 @@ impl ServerHandler for ObsidianMcp {
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(
-                "Obsidian vault MCP server. Provides tools to read, write, search, \
-                 and navigate your Obsidian notes via direct filesystem access.",
-            )
+            .with_instructions(self.server_instructions.clone())
     }
 }
 
@@ -423,6 +434,22 @@ mod tests {
             prefetch_count: 50,
             vault_ensured: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn server_instructions_use_nonempty_configuration() {
+        assert_eq!(
+            resolve_server_instructions(Some("Read root AGENT.md first.".to_string())),
+            "Read root AGENT.md first."
+        );
+        assert_eq!(
+            resolve_server_instructions(Some("  ".to_string())),
+            DEFAULT_SERVER_INSTRUCTIONS
+        );
+        assert_eq!(
+            resolve_server_instructions(None),
+            DEFAULT_SERVER_INSTRUCTIONS
+        );
     }
 
     async fn call_tool_raw(
